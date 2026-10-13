@@ -9,10 +9,11 @@
 // 漂移记录和 iframe 快照在 storage.session，连接状态由 offscreen 维护。
 
 import * as cdp from './cdp.js';
+import { compat, compatNote } from './compat.js';
 import { matchChallenge, hostOf, hostMatches, L2_ORIGINS_SEED } from './risk.js';
 import { CRED_URL, redactCreds } from './redact.js';
 import { identityOf, stripMarkPrefix } from './identity.js';
-import { validateScript, condText, repeatMax, EXEC_BUDGET } from './script.js';
+import { validateScript, condText, repeatMax, EXEC_BUDGET, collectRefs, toRecipe } from './script.js';
 
 // ---------- 连接层 ----------
 //
@@ -124,12 +125,14 @@ async function connState() {
 
 // 桥版本对不上时亮角标。npx 原地刷新了扩展文件、Chrome 跑的却还是旧 SW，
 // 这种错位以前只有 bridge.log 知道（22 条记录，没人看）。
+// 只在真需要人动手时亮：补丁号差异互相兼容，亮「!」只会把人吓去重装（判定见 compat.js）。
 function noteBridgeVersion(v) {
   if (!v) return;
   const mine = chrome.runtime.getManifest().version;
-  bridgeMismatch = v === mine ? '' : v;
+  const level = compat({ ext: mine, cli: v });
+  bridgeMismatch = (level === 'same' || level === 'patch') ? '' : v;
   chrome.action.setTitle({ title: bridgeMismatch
-    ? `huashu-chrome：扩展 v${mine} 和桥 v${v} 版本不一致，去 chrome://extensions 重载一次`
+    ? `huashu-chrome：${compatNote(level, { ext: mine, cli: v })}`
     : 'huashu-chrome' });
   setBadge(true);
 }
@@ -316,7 +319,7 @@ async function onMessage(msg) {
     if (marked) void syncMark(marked, { sid: msg.sid, act: actText(msg.cmd, msg.params) });
     // 教练搭在回执尾部。await 的代价是一次 storage 读写（约 1ms），
     // 相比它要省下的 6 秒模型回合可以忽略
-    const tip = (await coachNote(msg.sid, msg.cmd)) + (await multiLineNote(msg.sid, msg.tabId, msg.cmd, tabId));
+    const tip = (await coachNote(msg.sid, msg.cmd)) + (await pagingNote(msg.sid, msg.cmd, msg.params)) + (await multiLineNote(msg.sid, msg.tabId, msg.cmd, tabId));
     if (tip) {
       if (typeof data === 'string') data += tip;
       else if (data && typeof data.text === 'string') data.text += tip;
@@ -341,7 +344,7 @@ async function onMessage(msg) {
 // 模型回合（中位 5.8s），浏览器执行只占 2%（click 中位 0.2s）。批处理工具
 // 一直都在，但 agent 不用——在回执里当面提醒，比任何文档都有效。
 // 只提醒、不阻塞、不改变任何结果；agent 用了一次 act 就闭嘴重数。
-// 两档：第 3 条提 act；act 提示被无视、单发滚到第 8 条，升级提双脑（能起
+// 两档：第 2 条提 act；act 提示被无视、单发滚到第 8 条，升级提双脑（能起
 // subagent 的宿主才用得上，起不了的忽略——回执是唯一不被 instructions
 // 截断的通道，见 test/mcp.test.js 的 STRATEGY 预算注释）。之后归零重数。
 const BATCHABLE = new Set(['click', 'type', 'select', 'fill', 'key', 'navigate']);
@@ -354,8 +357,10 @@ async function coachNote(sid, cmd) {
     if (!BATCHABLE.has(cmd)) return '';   // 读页面不算——观察和行动的节奏不同
     const { [key]: n = 0 } = await chrome.storage.session.get(key);
     await chrome.storage.session.set({ [key]: n + 1 });
-    if (n + 1 === 3) {
-      return '\n\n💡 已连续 3 条单发操作。下一步若已可预判，用 act(steps:[…]) 一次跑完：'
+    // 第 3 条才提的那版，act 占写操作的比例在 1.2.1 反而跌到 24.6%：等提醒出现，
+    // 这一串已经单发完了。第 2 条就说，下一条还来得及合并
+    if (n + 1 === 2) {
+      return '\n\n💡 已连续 2 条单发操作。下一步若已可预判，用 act(steps:[…]) 一次跑完：'
         + '每合并一步省一个完整模型回合（实测回合中位约 6 秒，浏览器执行仅 0.2 秒）。'
         + '翻页循环用 repeat、可选弹窗用 if、状态检查用 assert。';
     }
@@ -367,6 +372,39 @@ async function coachNote(sid, cmd) {
     }
   } catch { /* 教练缺席不影响干活 */ }
   return '';
+}
+
+// 手动翻页检测。fetch 早就有 pages 参数一次翻完，但审计里串行 fetch→fetch 有 1493 次，
+// 其中 788 次是同一个 URL 只改一个数字参数（B站评论 pn=N、公众号 begin=N）。
+// 连续第 2 次撞上同一模板就当面说，并把参数名替它填好。
+function pagingParam(a, b) {
+  try {
+    const x = new URL(a), y = new URL(b);
+    if (x.origin + x.pathname !== y.origin + y.pathname) return null;
+    const diff = [];
+    const keys = new Set([...x.searchParams.keys(), ...y.searchParams.keys()]);
+    for (const k of keys) if (x.searchParams.get(k) !== y.searchParams.get(k)) diff.push(k);
+    if (diff.length !== 1) return null;
+    const k = diff[0], va = x.searchParams.get(k), vb = y.searchParams.get(k);
+    return /^\d+$/.test(va || '') && /^\d+$/.test(vb || '') ? { k, from: Number(va), step: Number(vb) - Number(va) } : null;
+  } catch { return null; }
+}
+
+async function pagingNote(sid, cmd, params) {
+  if (!sid || cmd !== 'fetch' || params?.pages || params?.binary || !params?.url) return '';
+  const key = `lastFetch:${sid}`;
+  try {
+    const { [key]: last } = await chrome.storage.session.get(key);
+    await chrome.storage.session.set({ [key]: { url: params.url, hits: 0 } });
+    const pg = last?.url && pagingParam(last.url, params.url);
+    if (!pg) return '';
+    const hits = (last.hits || 0) + 1;
+    await chrome.storage.session.set({ [key]: { url: params.url, hits } });
+    if (hits !== 1) return '';
+    return `\n\n💡 这像是在手动翻页（只有 ${pg.k} 在变）。剩下的页用一次 fetch 翻完：`
+      + `pages:{param:"${pg.k}", from:${pg.from + 2 * pg.step}${pg.step !== 1 ? `, step:${pg.step}` : ''}, max:20}，`
+      + `加 savePath 可以整批落盘——每一页省一个模型回合。`;
+  } catch { return ''; }
 }
 
 // 多线检测：本会话的户口簿上已有 ≥2 个还开着的标签页，这条命令却没带 tabId。
@@ -616,18 +654,30 @@ const postMark = (tabId, msg) => chrome.tabs.sendMessage(tabId, msg).then((r) =>
 // 先发后注：稳态下页面里的 mark.js 还在，一次消息往返（约 1ms）就完事；
 // 只有导航过、脚本被冲掉时才付一次 executeScript。反过来先探活再发是两次往返，
 // 而这个函数跟在每一条命令后面跑。
+// 侧栏要展示的那一份：和页内标记同源，按 tab 存进 storage.session，侧栏自己订阅。
+// 不经页面中转——页内标记可能被用户关掉、可能注不进（chrome:// 页），侧栏照样要能看。
+const panelKey = (tabId) => `panel:${tabId}`;
+
+async function notePanel(tabId, data) {
+  if (!data.owners.length) return chrome.storage.session.remove(panelKey(tabId)).catch(() => {});
+  const { __hcMark, ...rest } = data;
+  await chrome.storage.session.set({ [panelKey(tabId)]: { ...rest, actAt: data.act ? Date.now() : 0, at: Date.now() } }).catch(() => {});
+}
+
 async function syncMark(tabId, { act, sid, plan } = {}) {
   if (!tabId) return;
   try {
-    if (!(await markEnabled())) return;
     const owners = await ownersOfTab(tabId);
+    if (act && sid) await pushActLog(sid, act);
+    // plan 每次都覆盖：批处理一结束它就该消失，
+    // 「接下来」栏里挂着永远不会跑的步骤是在骗用户
+    const msg = { __hcMark: 'set', owners, act: act || null, sid, plan: plan || null, tabLabel: await getLabel(tabId), ...(await panelData(owners)) };
+    // 侧栏不受「控制标记」开关管：那个开关是为录屏时页面上别多一圈边框，侧栏不在画面里
+    void notePanel(tabId, msg);
+    if (!(await markEnabled())) return;
     // 标签组跟着同一份归属关系走，但不挤在这条 await 链上：
     // 组画不上（用户正在拖标签页、旧 Chrome 没有 API）不该拖累页内标记。
     void syncGroup(tabId, owners);
-    if (act && sid) await pushActLog(sid, act);
-    // plan 不落盘、每次 set 都覆盖：批处理一结束它就该消失，
-    // 「接下来」栏里挂着永远不会跑的步骤是在骗用户
-    const msg = { __hcMark: 'set', owners, act: act || null, sid, plan: plan || null, tabLabel: await getLabel(tabId), ...(await panelData(owners)) };
     await noteMarked(tabId, owners.length > 0);
     if (await postMark(tabId, msg)) return;
     // 没人接消息 = 页面里没有 mark.js。既然这页也没有主，就别为了摘一个
@@ -893,30 +943,71 @@ function routeOf(p) {
 const contentBudget = (p) => {
   if (p?.__hc === 'wait') return (Number(p.timeout) || 10000) + 5000;
   if (p?.__hc === 'scroll') return Math.min(Number(p.times) || 1, 50) * (Number(p.wait) || 700) + 10000;
-  // ready 不单列：它自己的静默窗口只有 1.5 秒，外层 waitForReady 的 hardCap
-  // 是 12 秒，都在默认预算以内——写一条算出来等于 15000 的规则纯属噪音。
   return 15000;
 };
 
+// 页面脚本不应答时先查清是谁卡住的，再开口。老实现一律报「有弹窗，让用户关掉」：
+// 经验库 11 个站记过这条误报（小红书的笔记明写「没有任何弹窗」），阿里云一次任务
+// 因此连续 ask 三次。真实原因有四种，只有真弹窗需要人：
+//   冻结 —— 后台标签页被 Chrome 冻住，CDP 拉回 active 后重试一次即可
+//   回收 —— 内存紧张时整页被丢弃，只能重新加载
+//   弹窗 —— attach 后 Chrome 会补发已开着的框，拿到原文再请人处理
+//   忙   —— 页面在跑重脚本，改走 network / fetch 读数据比干等有用
+const STALL = Symbol('stall');
+
+async function diagnoseStall(tabId, budget) {
+  const secs = Math.round(budget / 1000);
+  const tab = await chrome.tabs.get(tabId).catch(() => null);
+  if (!tab) return err('NO_TAB', '标签页已经关了');
+  if (tab.discarded) {
+    return err('TAB_DISCARDED', `这个标签页被 Chrome 回收了（内存紧张时会丢弃后台页），页面脚本已不存在。navigate(action:"reload") 重新加载即可。`);
+  }
+  let dialog = cdp.pendingDialog(tabId);
+  // 探测设上限：页面主线程被重脚本占满时 Page.enable 也回不来——那本身就说明是「忙」不是「框」
+  // （对话框开着时渲染进程仍在服务 CDP，探测会正常返回）
+  if (!dialog && await cdp.isEnabled()) {
+    dialog = await Promise.race([cdp.probeDialog(tabId).catch(() => null), sleep(2500).then(() => null)]);
+  }
+  if (dialog) {
+    return err('DIALOG_BLOCKING', `页面上开着一个 ${dialog.type} 对话框：「${String(dialog.message || '').slice(0, 120)}」。`
+      + `它挡住了页面的全部脚本。这个框要由用户决定点哪个按钮——用 ask 把框里的原文告诉他，请他处理。`);
+  }
+  return err('PAGE_BUSY', `页面脚本 ${secs} 秒没有响应，但没有发现对话框——页面多半在跑重脚本，或者后台页被浏览器限流。`
+    + `别让用户去关什么框。要数据就改走 network / fetch；要操作就稍后重试一次，仍不行再 tabs(action:"select", focus:true) 拉到前台。`);
+}
+
 async function toContent(tabId, payload, frameId = 0) {
   await ensureContent(tabId, frameId);
+  const budget = contentBudget(payload);
+  const send = () => {
+    let timer;
+    return Promise.race([
+      chrome.tabs.sendMessage(tabId, payload, { frameId }),
+      new Promise((_, rej) => { timer = setTimeout(() => rej(STALL), budget); }),
+    ]).finally(() => clearTimeout(timer));
+  };
   let r;
   try {
-    let timer;
-    const budget = contentBudget(payload);
-    r = await Promise.race([
-      chrome.tabs.sendMessage(tabId, payload, { frameId }),
-      new Promise((_, rej) => {
-        timer = setTimeout(() => rej(err('DIALOG_BLOCKING',
-          `页面脚本 ${Math.round(budget / 1000)} 秒没有响应。最常见的原因是这一页上弹了 `
-          + `alert / confirm / 「离开此页？」对话框——一弹出来页面的 JS 就全停了，扩展也够不着它。\n`
-          + `请让用户到浏览器里手动关掉那个框。别原样重试，wait 走的是同一条路，一样会挂住。\n`
-          + `（也可能是页面正在跑一段很重的脚本，那种情况稍后重试是有用的。）`)), budget);
-      }),
-    ]).finally(() => clearTimeout(timer));
+    r = await send();
   } catch (e) {
-    if (e?.code) throw e;
-    throw err('TIMEOUT', `页面无响应（${e.message}）`);
+    if (e === STALL) {
+      // 冻结是唯一能自己解开的情况：解冻后同一条消息再发一次
+      const tab = await chrome.tabs.get(tabId).catch(() => null);
+      if (tab?.frozen && await cdp.isEnabled()) {
+        try {
+          await Promise.race([cdp.unfreeze(tabId), sleep(2500)]);
+          r = await send();
+        } catch (e2) {
+          if (e2 !== STALL) throw e2?.code ? e2 : err('TIMEOUT', `页面无响应（${e2?.message}）`);
+          throw await diagnoseStall(tabId, budget);
+        }
+      } else {
+        throw await diagnoseStall(tabId, budget);
+      }
+    } else {
+      if (e?.code) throw e;
+      throw err('TIMEOUT', `页面无响应（${e.message}）`);
+    }
   }
   if (!r) throw err('INTERNAL', '页面脚本没有返回');
   if (r.error) throw err(r.error.code, r.error.message);
@@ -990,11 +1081,24 @@ async function waitForReady(tabId, { hardCap = 12000, quiet = 300, expectNav = f
   } catch {
     return;   // 标签页没了，交给调用方后面的操作去报错
   }
-  const deadline = Date.now() + hardCap;
+  // 计时在这一侧（SW 定时器不受后台标签页节流），页面只报「这段时间新增了多少节点」。
+  // 判据和原来一样：DOMContentLoaded 之后，连续 quiet 毫秒没有成规模的增长（≥5 个节点）
+  // 就算首屏落定；直播弹幕、行情页永远落不定，所以落定窗口最多 1.5 秒。
+  // 一两个节点的零星追加（时钟、事件记录仪）不算——实测按「完全静默」判会把靶场拖到 10 秒。
+  await domQuiet(tabId, { quiet, cap: 1500, deadline: Date.now() + hardCap });
+}
+
+async function domQuiet(tabId, { quiet, cap, deadline }) {
+  let readyAt = 0, lastBurst = 0;
   while (Date.now() < deadline) {
     try {
-      const r = await toContent(tabId, { __hc: 'ready', quiet, budget: deadline - Date.now() });
-      if (r?.ready) return;
+      const r = await toContent(tabId, { __hc: 'domActivity' });
+      if (!r.loading) {
+        const now = Date.now();
+        if (!readyAt) { readyAt = now; lastBurst = now; }
+        if (r.added >= 5) lastBurst = now;
+        if (now - lastBurst >= quiet || now - readyAt >= cap) return;
+      }
     } catch {
       // 正在跳转、或 content script 还没起来。下一轮再问。
       // 这里不抛错：调用方后面自己会撞上真正的错误，那个比这儿造一个有信息量。
@@ -1449,6 +1553,81 @@ async function confirmPay(id, pay) {
   return res.outcome === 'continued';
 }
 
+// ---------- 写请求旁证 ----------
+//
+// 很多站的「提交」在 DOM 上不留痕迹：点赞、保存草稿、发私信、设定时——请求发出去了，
+// 页面过一会儿才变，或者根本不变。只看 DOM 的效果证据会判成「页面完全没有反应」，
+// 经验库里约 15 个站记过这种误判；更糟的是零证据会触发自动用真实事件再点一次，
+// 对点赞这类来回切换的按钮，第二下就把第一下撤销了。
+//
+// 所以写操作前往受控页（顶层）挂一个极小的钩子：只记非 GET 请求的方法、路径和状态码，
+// 不读响应体、不记 query（可能带 token），不外发；操作后取出这一次期间的那几条。
+// 和 net-hook.js 是两件事：那个记全量响应体、只在 agent 用 network 时注册；
+// 这个只为回答「这一下有没有真的提交出去」，开销只有两次 executeScript。
+function sniffWrites() {
+  if (!window.__hcW) {
+    const log = window.__hcW = [];
+    window.__hcWn = 0;
+    const path = (u) => { try { const x = new URL(String(u), location.href); return (x.host === location.host ? '' : x.host) + x.pathname; } catch { return String(u).split('?')[0].slice(0, 120); } };
+    const add = (m, u) => {
+      const rec = { n: ++window.__hcWn, m: String(m || 'GET').toUpperCase(), u: path(u), s: null };
+      log.push(rec); if (log.length > 40) log.shift();
+      return rec;
+    };
+    const quiet = (m) => /^(GET|HEAD|OPTIONS)$/i.test(String(m || 'GET'));
+    const of = window.fetch;
+    if (of) {
+      window.fetch = function (input, init) {
+        const m = (init && init.method) || (input && input.method) || 'GET';
+        const pr = of.apply(this, arguments);
+        if (!quiet(m)) {
+          const rec = add(m, typeof input === 'string' ? input : (input && input.url) || input);
+          pr.then((r) => { rec.s = r.status; }, () => { rec.s = 0; });
+        }
+        return pr;
+      };
+    }
+    const X = XMLHttpRequest.prototype, oOpen = X.open, oSend = X.send;
+    X.open = function (m, u) { this.__hcWm = [m, u]; return oOpen.apply(this, arguments); };
+    X.send = function () {
+      const mu = this.__hcWm;
+      if (mu && !quiet(mu[0])) {
+        const rec = add(mu[0], mu[1]);
+        this.addEventListener('loadend', () => { rec.s = this.status; });
+      }
+      return oSend.apply(this, arguments);
+    };
+    if (navigator.sendBeacon) {
+      const ob = navigator.sendBeacon.bind(navigator);
+      navigator.sendBeacon = (u, d) => { const ok = ob(u, d); add('BEACON', u).s = ok ? 'queued' : 0; return ok; };
+    }
+  }
+  return window.__hcWn;
+}
+
+async function armWrites(tabId) {
+  try {
+    const [r] = await chrome.scripting.executeScript({ target: { tabId }, world: 'MAIN', func: sniffWrites });
+    return typeof r?.result === 'number' ? r.result : null;
+  } catch { return null; }   // chrome:// 之类注不进，就当没有旁证
+}
+
+async function readWrites(tabId, since) {
+  if (since == null) return [];
+  try {
+    const [r] = await chrome.scripting.executeScript({
+      target: { tabId }, world: 'MAIN',
+      func: (n) => (window.__hcW || []).filter((x) => x.n > n).map(({ m, u, s }) => ({ m, u, s })),
+      args: [since],
+    });
+    // 埋点上报（beacon、日志、统计）不算提交——它们每次点击都会发，算进来就等于永远「有效果」
+    return (r?.result || []).filter((x) => x.m !== 'BEACON' && !/(log|track|collect|stat|report|metric|beacon|analytics|monitor|sentry|apm)/i.test(x.u));
+  } catch { return []; }
+}
+
+const writesText = (ws) => ws.slice(0, 4).map((w) => `${w.m} ${w.u} → ${w.s == null ? '未回' : w.s}`).join('；')
+  + (ws.length > 4 ? `；…共 ${ws.length} 个` : '');
+
 async function performCore(id, cmd, p, { blockSensitive = false } = {}, ctx) {
   const { frameId, params } = await prepare(id, p);
   const before = (await chrome.tabs.get(id)).url;
@@ -1464,6 +1643,7 @@ async function performCore(id, cmd, p, { blockSensitive = false } = {}, ctx) {
   // 坐标点不到「按钮文案」，这条路的安全边界是它本来就要求显式给坐标。
   if (cmd === 'click' && !hasTarget && Number.isFinite(params.x) && Number.isFinite(params.y)) {
     const base = await toContent(id, { __hc: 'locate', baselineOnly: true }, frameId).catch(() => null);
+    const wmark = await armWrites(id);
     const x = Number(params.x), y = Number(params.y);
     let note;
     if (params.dragTo && Number.isFinite(params.dragTo.x) && Number.isFinite(params.dragTo.y)) {
@@ -1474,6 +1654,7 @@ async function performCore(id, cmd, p, { blockSensitive = false } = {}, ctx) {
       note = `已点击坐标 (${x}, ${y})（真实事件）`;
     }
     const ev = await settle(id, frameId, { ...params, ref: undefined }, base?.baseline, before);
+    ev.writes = await readWrites(id, wmark);
     const after = (await chrome.tabs.get(id)).url;
     return { note, l2note: '', ev, navigated: before !== after, upgraded: false };
   }
@@ -1520,6 +1701,7 @@ async function performCore(id, cmd, p, { blockSensitive = false } = {}, ctx) {
   };
 
   let note = '', usedL2 = layer === 'L2', l2note = '';
+  const wmark = await armWrites(id);
   try {
     note = usedL2 ? await execL2(id, cmd, params, loc) : await runL1();
   } catch (e) {
@@ -1532,11 +1714,12 @@ async function performCore(id, cmd, p, { blockSensitive = false } = {}, ctx) {
   }
 
   let ev = await settle(id, frameId, params, loc?.baseline, before);
+  ev.writes = await readWrites(id, wmark);
 
-  // 零证据 → 自动升级。敏感目标除外：L1 可能其实已经生效只是没留下痕迹，
+  // 零证据 → 自动升级。发出过写请求不算零证据：那一下已经生效了，再点一次就是第二次。敏感目标除外：L1 可能其实已经生效只是没留下痕迹，
   // 对「提交/支付/删除」重试一次就是下第二笔单，这个闸门是确定性的，不问模型。
   let upgraded = false;
-  if (!ev.changed && !usedL2 && l2ok && !params.real) {
+  if (!ev.changed && !ev.writes.length && !usedL2 && l2ok && !params.real) {
     if (loc?.sensitive) {
       l2note = '（没有自动用真实事件重试：这是提交/支付/删除一类的动作，'
              + '重试可能造成重复执行。确认需要请显式传 real:true）';
@@ -1546,6 +1729,7 @@ async function performCore(id, cmd, p, { blockSensitive = false } = {}, ctx) {
         usedL2 = true;
         upgraded = true;
         ev = await settle(id, frameId, params, loc?.baseline, before);
+        ev.writes = await readWrites(id, wmark);
       } catch (e) {
         l2note = `（普通事件无效，真实事件也没能用上：${e.message}）`;
       }
@@ -1656,6 +1840,10 @@ function effectLines({ note, l2note, ev, upgraded, followed }) {
     ev.expectUnmet ? `⚠️ 期望未满足（等了 ${SETTLE_MS / 1000}s）：${ev.expectUnmet}。别按「成功」往下走。` : '',
     ev.changed
       ? `效果：${ev.parts.join('；')}` + (ev.volatile ? '　（注意：这个页面本身也在持续变化）' : '')
+        + (ev.writes?.length ? `\n请求：${writesText(ev.writes)}` : '')
+      : ev.writes?.length
+        ? `效果：页面上暂时没有可见变化，但这次操作发出了请求：${writesText(ev.writes)}。`
+          + `提交多半已经生效——先读结果（快照、network 或目标页面）再决定，别重试。`
       : ev.unattributable
         ? `⚠️ 没有可归因于这次操作的变化。这个页面本身在持续变化（${ev.parts.join('；')}），`
           + `但目标元素的状态没动、也没有新的页面提示——那些变化多半不是这次操作造成的。`
@@ -1676,6 +1864,13 @@ async function perform(id, cmd, p, ctx) {
   return { ...snap, text: `${head}\n\n${snap.text}`, navigated: r.navigated || !!r.followed };
 }
 
+// 快照「几乎是空的」：可交互元素不超过 3 个，正文节选不到 120 字
+function sparse(text) {
+  const n = Number(/(\d+) 个可交互元素/.exec(text || '')?.[1] ?? 99);
+  const excerpt = String(text || '').split('--- 正文节选')[1] || '';
+  return n <= 3 && excerpt.replace(/\s+/g, '').length < 160;
+}
+
 const HANDLERS = {
   async snapshot(p, tabId, ctx) {
     const id = await resolveTab(tabId);
@@ -1683,8 +1878,18 @@ const HANDLERS = {
     // 先等页面安静一小会儿再拍。以前直接拍，骨架屏/loading 态照拍不误，
     // agent 拿到一份「什么都还没有」的快照只能再拍一次当轮询用
     //（审计里同一 tab 连拍两次 588 回）。150ms 的静默窗口换掉那一整个回合。
-    await toContent(id, { __hc: 'ready', quiet: 150, budget: 800 }).catch(() => {});
-    const snap = await guardCreds(id, await snapshotAll(id, p));
+    await domQuiet(id, { quiet: 150, cap: 800, deadline: Date.now() + 1500 }).catch(() => {});
+    let snap = await guardCreds(id, await snapshotAll(id, p));
+    // 后台页几乎是空的：多半是没出帧、停在骨架屏，不是真没内容。推一帧再拍一次，
+    // 省掉 agent「以为没登录 / 以为加载失败」之后的那几轮试探
+    if (sparse(snap.text) && !(await chrome.tabs.get(id).catch(() => ({ active: true }))).active && await cdp.isEnabled()) {
+      try {
+        await cdp.forceFrame(id);
+        await domQuiet(id, { quiet: 300, cap: 1500, deadline: Date.now() + 2500 });
+        const again = await guardCreds(id, await snapshotAll(id, p));
+        if (!sparse(again.text)) snap = { ...again, text: '（这一页在后台没渲染完，已自动推了一帧再拍）\n' + again.text };
+      } catch { /* 推不动就按原样返回 */ }
+    }
     return drift ? { ...snap, text: drift + '\n' + snap.text } : snap;
   },
 
@@ -1720,6 +1925,12 @@ const HANDLERS = {
     if (bad) throw err('INTERNAL', bad);
 
     const drift = await driftNote(id, ctx?.sid);
+    // 剧本沉淀要的两样起点信息：从哪个页面开始、ref 各指什么（ref 只在这一刻的快照里有效）
+    const startUrl = (await chrome.tabs.get(id).catch(() => null))?.url || '';
+    const usedRefs = collectRefs(steps);
+    const refInfo = usedRefs.length && !usedRefs.some((r) => r.includes('@'))
+      ? await toContent(id, { __hc: 'describeRefs', refs: usedRefs }).catch(() => ({}))
+      : {};
     const done = [];
     let stopped = null;       // { label, why, i? } 一旦置上，整个剧本停机
     // 页面结构一旦变过，之前那份快照里的 ref 全部作废——只有 find 还能用
@@ -1798,6 +2009,11 @@ const HANDLERS = {
           stopped = { label, why: `期望未满足：${r.ev.expectUnmet}。页面没变成这一步预期的样子，后面的步骤不该跑。` };
           return;
         }
+        // 发出了写请求的一步算生效：批处理接着往下跑，回执里写明请求
+        if (!r.ev.changed && r.ev.writes?.length) {
+          out.push(`✅ ${label}　请求：${writesText(r.ev.writes)}（页面上暂时没有可见变化）`);
+          return;
+        }
         if (!r.ev.changed) {
           stopped = {
             label,
@@ -1806,7 +2022,7 @@ const HANDLERS = {
           };
           return;
         }
-        out.push(`✅ ${label}　效果：${r.ev.parts.join('；')}`);
+        out.push(`✅ ${label}　效果：${r.ev.parts.join('；')}` + (r.ev.writes?.length ? `；请求：${writesText(r.ev.writes)}` : ''));
         // 只有「结构性」变化才作废 ref：填个值、勾个框不影响编号，
         // 而连续填表正是批处理最常见的用法，不该逼它们全用 find。
         // 区块里多了三五个节点也不算——那是 ripple、下拉箭头、校验图标这类
@@ -1885,7 +2101,9 @@ const HANDLERS = {
         : '',
     ].filter(Boolean).join('\n');
 
-    return { ...snap, text: `${head}\n\n${snap.text}`, completed: !stopped, doneCount: doneTop };
+    // 完整跑通才沉淀；停在半路的剧本不是「摸清了的流程」
+    const recipe = stopped ? null : toRecipe(steps, refInfo);
+    return { ...snap, text: `${head}\n\n${snap.text}`, completed: !stopped, doneCount: doneTop, ...(recipe ? { recipe, recipeFrom: startUrl } : {}) };
   },
 
   // 五个写操作走同一条路径：定位 → 执行（L1 或 L2）→ 采效果证据 → 必要时升级重试。
@@ -2131,15 +2349,32 @@ const HANDLERS = {
       guarded = true;
     } catch { /* 没有 content script 就没有这道防线，eval 照常跑 */ }
 
+    // code 是常见的误用名（经验库记过三次「传 code 报语法错」），直接认
+    const src = String(p.expr ?? p.code ?? '').trim();
+    if (!src) throw err('BAD_PARAMS', 'eval 需要 expr：一段 JS 表达式或语句');
     let result;
     try {
       ([{ result } = {}] = await chrome.scripting.executeScript({
         target: { tabId: id },
         world: 'MAIN',
-        func: (src, max) => {
+        // 三档解析，只在「语法不对」时才换下一档，所以有副作用的代码不会被跑两遍：
+        //   ① 当表达式（对象字面量 {a:1} 要靠这层括号）
+        //   ② 当语句序列——间接 eval 返回最后一条语句的值，`const a=…; a.length` 直接能用
+        //   ③ 含 await 的包成 async 函数（这一档要显式 return）
+        // 审计里 agent 反复撞「Unexpected token」「await is only valid…」再改写重试，每次白费一个回合。
+        func: async (src, max) => {
           try {
             // eslint-disable-next-line no-eval
-            const v = (0, eval)(`"use strict"; (${src})`);
+            const ev = (0, eval);
+            let v;
+            try { v = ev(`"use strict"; (${src})`); } catch (e1) {
+              if (!(e1 instanceof SyntaxError)) throw e1;
+              try { v = ev(`"use strict"; ${src}`); } catch (e2) {
+                if (!(e2 instanceof SyntaxError) || !/\bawait\b/.test(src)) throw e2;
+                v = ev(`(async () => { "use strict"; ${src}\n})()`);
+              }
+            }
+            v = await v;
             let s;
             try { s = JSON.stringify(v, null, 2); } catch { s = String(v); }
             if (s === undefined) s = 'undefined';
@@ -2148,7 +2383,7 @@ const HANDLERS = {
             return { ok: false, message: String((e && e.message) || e) };
           }
         },
-        args: [String(p.expr || ''), p.maxLength || 20000],
+        args: [src, p.maxLength || 20000],
       }));
     } finally {
       if (guarded) {
@@ -2170,7 +2405,7 @@ const HANDLERS = {
       // 走页面世界就够，没必要为它们挂一下黄条。
       if (csp) {
         try {
-          return { untrusted: true, text: await cdp.evaluate(id, `(${p.expr})`, { maxLength: p.maxLength || 20000 }) };
+          return { untrusted: true, text: await cdp.evaluate(id, src, { maxLength: p.maxLength || 20000 }) };
         } catch (e) {
           throw err(e.code === 'NEEDS_L2' || e.code === 'L2_BUSY' ? e.code : 'INTERNAL',
             e.code === 'NEEDS_L2'
@@ -2181,7 +2416,11 @@ const HANDLERS = {
       }
       throw err('INTERNAL', `表达式执行失败：${result.message}`);
     }
-    return { untrusted: true, text: result.text };
+    // 审计里读整页文本的 eval 有 1299 次，其中 385 次是同一句。read_text 给的是同样的东西，
+    // 而且不受 CSP 限制（eval 在大站上要挂调试器才跑得通）——说一句，下次就省了
+    const tip = /\b(document\.body|document\.documentElement)\.innerText\b/.test(src)
+      ? '\n\n（提示：整页文本用 read_text(scope:"page") 拿，结果一样，大站上不用挂调试器。）' : '';
+    return { untrusted: true, text: result.text + tip };
   },
 
   // captureVisibleTab 截的是「那个窗口当前可见的标签页」，不是我们的受控标签页。
@@ -2424,6 +2663,15 @@ const veilMarks = (tabId, on) =>
 
 // ---------- 生命周期 ----------
 
+// 点工具栏图标 = 打开侧栏。状态、开关、当前页 agent 在做什么都在那里（原 popup 并入）。
+chrome.sidePanel?.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => {});
+
+// 从商店装好扩展的人，以前落地后什么都看不到——引导只存在于终端那条路上。
+// 首装时打开欢迎页，它会实时探测本地端，连上就变绿。更新不打扰。
+chrome.runtime.onInstalled.addListener(({ reason }) => {
+  if (reason === 'install') chrome.tabs.create({ url: chrome.runtime.getURL('welcome.html') }).catch(() => {});
+});
+
 // alarm 是 SW 被回收之后唯一能把它叫醒的东西，所以**每次 SW 醒来都重建一遍**，
 // 不只在 onInstalled / onStartup 里建。
 //
@@ -2471,7 +2719,7 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
   // ReferenceError；而这个异常发生在下面 remove() / emit('tab_closed') 之前，
   // 于是 seen:/frames: 键永远清不掉、桥也收不到标签页关闭事件。
   const gone = Object.keys(sess).filter((k) =>
-    (k.startsWith('seen:') && k.endsWith(':' + tabId)) || k === frameSnapKey(tabId));
+    (k.startsWith('seen:') && k.endsWith(':' + tabId)) || k === frameSnapKey(tabId) || k === panelKey(tabId));
   if (gone.length) await chrome.storage.session.remove(gone);
   await noteMarked(tabId, false);
   emit('tab_closed', { tabId });
@@ -2487,7 +2735,7 @@ chrome.tabs.onUpdated.addListener((tabId, info) => {
   if (info.status === 'complete') void syncMark(tabId);
 });
 
-chrome.runtime.onMessage.addListener((m, _s, sendResponse) => {
+chrome.runtime.onMessage.addListener((m, sender, sendResponse) => {
   // offscreen 递进来的：桥发来的命令/事件。这条消息同时把被回收的 SW 叫醒——
   // 这正是把 socket 搬出去之后，SW 仍然能及时干活的原因。
   if (m?.__hcBridge === 'in') {
@@ -2519,6 +2767,21 @@ chrome.runtime.onMessage.addListener((m, _s, sendResponse) => {
     chrome.storage.session.set({ bridgeConnected: !!m.connected }).catch(() => {});
     setBadge(!!m.connected);
     return false;
+  }
+
+  // 页内小头像被点了：打开这个窗口的侧栏。sidePanel.open 要求用户手势，
+  // 内容脚本在 click 里发来的消息带着这次手势（Chrome 116+）。
+  if (m?.__hcPanel === 'open' && sender.tab) {
+    chrome.sidePanel.open({ windowId: sender.tab.windowId })
+      .then(() => sendResponse({ ok: true }), (e) => sendResponse({ ok: false, error: e.message }));
+    return true;
+  }
+  // 侧栏里点某个会话：切到它正在控的那一页
+  if (m?.__hcPopup === 'focusTab' && m.tabId) {
+    chrome.tabs.update(m.tabId, { active: true }).then(
+      (t) => chrome.windows.update(t.windowId, { focused: true }).catch(() => {}),
+    ).catch(() => {}).finally(() => sendResponse({ ok: true }));
+    return true;
   }
 
   if (m.__hcPopup === 'status') {

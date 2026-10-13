@@ -504,14 +504,22 @@
 
   // ---------- 正文提取（渡口 grab 的思路：先找主容器，再剥噪声） ----------
 
-  function mainText() {
-    const cand = document.querySelector('article, main, [role="main"], #js_content, .article-content, .post-content') || document.body;
-    const clone = cand.cloneNode(true);
-    // form 不剥：以前剥了，于是表单页的字段标签、校验文案、说明文字全不在节选里，
-    // 而表单向导正是最需要「读一眼再决定」的那类页面。<select> 的选项文本会跟着
-    // 进来，是可接受的噪音。
-    clone.querySelectorAll('script, style, nav, header, footer, aside, noscript, svg, iframe, [aria-hidden="true"]').forEach((n) => n.remove());
-    return (clone.innerText || '')
+  // innerText 必须在活节点上取：克隆出来的节点不参与渲染，innerText 退化成 textContent，
+  // 块级元素之间的换行全丢——表格的列会拼成「362223585554365」这种拆不开的数字串。
+  // 这是 agent 宁可自己 eval document.body.innerText（审计里 1299 次）也不用 read_text 的主因。
+  // 剥噪声改成「从活文本里减掉 nav/header/footer/aside 那几段」，效果一样，换行不丢。
+  // all=true 就是整页（含导航、侧栏）——agent 要的常常就是这个。
+  function mainText(all) {
+    const cand = all ? document.body
+      : (document.querySelector('article, main, [role="main"], #js_content, .article-content, .post-content') || document.body);
+    let t = cand.innerText || '';
+    if (!all) {
+      for (const n of cand.querySelectorAll('nav, header, footer, aside')) {
+        const x = (n.innerText || '').trim();
+        if (x.length > 1) t = t.replace(x, '');
+      }
+    }
+    return t
       .replace(/[\u200b-\u200f\u2060\ufeff\u00ad]/g, '')
       .replace(/[ \t]+\n/g, '\n')
       .replace(/\n{3,}/g, '\n\n')
@@ -1595,42 +1603,20 @@
   // agent 还得自己再等一次。
   //
   // 换成两段，各自对着一个真问题：先等 DOM 能用，再等它安静下来。
-  async function doReady(p) {
-    if (document.readyState === 'loading') {
-      await new Promise((r) => document.addEventListener('DOMContentLoaded', r, { once: true }));
+  // 页面就绪判定的「页面这一侧」：只数 DOM 新增了多少节点，计时全在 background 做。
+  //
+  // 以前计时器（静默 300ms、上限 1.5s）跑在这里，而 Chrome 把后台标签页的定时器对齐到
+  // 整秒——agent 恰恰全在后台干活，于是每次 navigate / 开新页都白等一两秒。
+  // MutationObserver 的回调是微任务，不受节流；SW 的定时器也不受。
+  let domAdded = 0, domMO = null;
+  function domActivity() {
+    if (!domMO) {
+      domMO = new MutationObserver((records) => { for (const r of records) domAdded += r.addedNodes.length; });
+      domMO.observe(document.documentElement, { childList: true, subtree: true });
     }
-    const quiet = Math.max(Number(p.quiet) || 300, 50);
-    // 硬上限必须卡死：直播弹幕、行情页永远等不到「完全没有 DOM 变化」，
-    // 不设上限的话它们会一路跑满预算，反而比原来的等法更慢。
-    const budget = Math.min(Math.max(Number(p.budget) || 1500, quiet), 1500);
-    const quieted = await new Promise((resolve) => {
-      let quietTimer = null;
-      const hard = setTimeout(() => done(false), budget);
-      const mo = new MutationObserver((records) => {
-        // 只有**成规模**的 DOM 增长才说明首屏还在渲染。
-        //
-        // 判「完全静默」的那版在两类页面上一起垮掉：靶场自带事件记录仪、
-        // 真实站点有时钟和弹幕——它们每几十毫秒往 DOM 里追加一两个节点，
-        // 于是计时器永远被重置，每次都跑满预算。实测把本地靶场的用例
-        // 从 1.8 秒拖到 10.5 秒，比它取代掉的那套还慢。
-        //
-        // 而这两件事的区别是规模：自娱自乐是一两个节点，首屏渲染是几十上百个。
-        let added = 0;
-        for (const r of records) added += r.addedNodes.length;
-        if (added < 5) return;
-        clearTimeout(quietTimer);
-        quietTimer = setTimeout(() => done(true), quiet);
-      });
-      mo.observe(document.documentElement, { childList: true, subtree: true });
-      quietTimer = setTimeout(() => done(true), quiet);
-      function done(ok) {
-        clearTimeout(quietTimer);
-        clearTimeout(hard);
-        mo.disconnect();
-        resolve(ok);
-      }
-    });
-    return { data: { ready: true, quieted } };
+    const added = domAdded;
+    domAdded = 0;
+    return { data: { added, loading: document.readyState === 'loading' } };
   }
 
   async function doWait(p) {
@@ -2030,6 +2016,15 @@
           case 'ping': return sendResponse({ pong: true });
           case 'snapshot': return sendResponse({ data: buildSnapshot() });
           case 'locate': return sendResponse({ data: await doLocate(msg) });
+          // 剧本沉淀用：把 act 里用到的 ref 翻译成 role + 可访问名（跨会话稳定的定位）
+          case 'describeRefs': {
+            const out = {};
+            for (const r of msg.refs || []) {
+              const rec = refMap.get(r);
+              if (rec) out[r] = { role: rec.role, name: rec.name };
+            }
+            return sendResponse({ data: out });
+          }
           // ask 要高亮的目标可能是 ref（只有这里的 refMap 认得），而高亮画在
           // ask-overlay 那一侧。打个临时属性当交接凭证，用完就摘。
           case 'markTargets': {
@@ -2055,7 +2050,7 @@
           case 'select': return sendResponse(doSelect(msg));
           case 'fill': return sendResponse(doFill(msg));
           case 'key': return sendResponse(doKey(msg));
-          case 'ready': return sendResponse(await doReady(msg));
+          case 'domActivity': return sendResponse(domActivity());
           case 'wait': return sendResponse(await doWait(msg));
           case 'query': return sendResponse(doQuery(msg));
           case 'read': return sendResponse(doRead(msg));
@@ -2073,7 +2068,7 @@
               data: {
                 untrusted: true,
                 meta: `url="${location.href}"`,
-                text: `# ${document.title}\n${location.href}\n\n` + (msg.format === 'text' ? mainText() : toMarkdown()),
+                text: `# ${document.title}\n${location.href}\n\n` + (msg.scope === 'page' ? mainText(true) : msg.format === 'text' ? mainText() : toMarkdown()),
               },
             });
           default:

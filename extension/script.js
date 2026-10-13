@@ -81,3 +81,62 @@ export function condText(cond) {
   const s = parts.join(' 或 ') || '（空条件）';
   return cond.not ? `非（${s}）` : s;
 }
+
+// ---------- 跑通即沉淀：把一次成功的 act 整理成可复用剧本 ----------
+//
+// 经验库里 122 个站只有 1 份 ```act 剧本——「摸清流程后写回来」这一步 agent 几乎从来不做。
+// 所以改成由工具来做初稿：一次 act 完整跑通（≥3 步、含写操作），就把它整理成剧本草稿，
+// 由 agent（必要时问用户）确认后再入库（花叔定的：先草稿、确认后入库）。
+//
+// 两件必须做的改写：
+//   ref → find：ref 是这一份快照的编号，下个会话一定对不上；role + 可访问名才跨会话稳定。
+//           没有名字的元素换不过去，整份剧本就不收——半份能跑的剧本比没有更糟。
+//   输入值 → {{占位符}}：type 的文字、fill 的值可能是私信正文或密码，绝不落盘。
+// 返回 null 表示「这次不值得或不能沉淀」。
+
+const WRITES = new Set(['click', 'type', 'fill', 'select', 'key']);
+
+export function collectRefs(steps) {
+  const out = new Set();
+  const walk = (list) => {
+    for (const st of list || []) {
+      if (!st) continue;
+      if (st.ref) out.add(String(st.ref));
+      for (const f of st.fields || []) if (f?.ref) out.add(String(f.ref));
+      walk(st.then); walk(st.else); walk(st.steps);
+    }
+  };
+  walk(steps);
+  return [...out];
+}
+
+export function toRecipe(steps, refInfo = {}) {
+  if (!Array.isArray(steps) || steps.length < 3) return null;
+  let n = 0, writes = 0, ok = true;
+  const slot = (hint) => `{{${hint || `值${++n}`}}}`;
+  const findOf = (ref) => {
+    const r = refInfo[ref];
+    if (!r?.name || String(ref).includes('@')) { ok = false; return null; }
+    return { role: r.role, name: r.name };
+  };
+  const conv = (st) => {
+    if (!st || typeof st !== 'object') return st;
+    const out = { ...st };
+    delete out.snapshotId;
+    if (WRITES.has(out.do)) writes++;
+    if (out.ref) { out.find = findOf(out.ref); delete out.ref; }
+    if (out.do === 'type' && typeof out.text === 'string') out.text = slot(out.find?.name ? `${out.find.name}` : null);
+    if (Array.isArray(out.fields)) {
+      out.fields = out.fields.map((f) => {
+        const g = { ...f };
+        if (g.ref) { g.find = findOf(g.ref); delete g.ref; }
+        if ('value' in g && typeof g.value === 'string') g.value = slot(g.find?.name || g.name || null);
+        return g;
+      });
+    }
+    for (const k of ['then', 'else', 'steps']) if (Array.isArray(out[k])) out[k] = out[k].map(conv);
+    return out;
+  };
+  const recipe = steps.map(conv);
+  return ok && writes ? recipe : null;
+}

@@ -9,7 +9,8 @@ import os from 'node:os';
 import path from 'node:path';
 
 process.env.HUASHU_CHROME_LEARNINGS_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'hc-learnings-'));
-const { getLearnings, saveLearnings, lintPlaybooks, LEARNINGS_DIR } = await import('../src/lib/learnings.js');
+const { getLearnings, saveLearnings, lintPlaybooks, LEARNINGS_DIR, cleanNote, saveDraft, adoptDraft } = await import('../src/lib/learnings.js');
+const { toRecipe } = await import('../extension/script.js');
 
 test('无参调用列出出厂经验的站点', () => {
   const out = getLearnings();
@@ -87,4 +88,69 @@ test('get 时有剧本才提示可执行，并保留「可能过时」的免责'
   // 没剧本的站点：零噪音
   const plain = getLearnings('jd.com');
   assert.ok(!plain.includes('可执行剧本'));
+});
+
+// ---------- 回贴防护与留底 ----------
+
+test('把 get 的全文原样存回去：出厂段、提示语、重复小节都被剥掉', () => {
+  saveLearnings('paste.example', '## 发布\n先点发布。');
+  const got = getLearnings('paste.example');
+  // 模拟 agent 的惯用法：get 回来改一句，整段存回，而且同一节贴了两遍
+  saveLearnings('paste.example', got + '\n\n## 发布\n先点发布。\n\n## 新发现\n草稿箱在右上角。');
+  const file = fs.readFileSync(path.join(LEARNINGS_DIR, 'paste.example.md'), 'utf8');
+  assert.doesNotMatch(file, /经验仅供参考/);
+  assert.doesNotMatch(file, /## 本机经验/);
+  assert.equal(file.match(/## 发布/g).length, 1);
+  assert.match(file, /草稿箱在右上角/);
+  assert.match(file, /^> 最后更新：\d{4}-\d{2}-\d{2}/);
+});
+
+test('回贴的出厂经验段整段剥掉，本机内容留下', () => {
+  const pasted = '## 出厂经验（huashu-chrome v1.2.1）\n\n出厂的一大段\n\n## 本机经验\n\n## 我的发现\n本机的一句';
+  const out = cleanNote(pasted);
+  assert.doesNotMatch(out, /出厂的一大段/);
+  assert.match(out, /本机的一句/);
+});
+
+test('覆盖保存前留底，留最近 10 份', () => {
+  for (let i = 0; i < 12; i++) saveLearnings('hist.example', `## 第${i}版\n内容${i}`);
+  const dir = path.join(LEARNINGS_DIR, '.history', 'hist.example');
+  assert.equal(fs.readdirSync(dir).length, 10);
+});
+
+// ---------- 剧本草稿 ----------
+
+test('跑通的 act 变草稿：ref 换 find，输入换占位符，原文不落盘', () => {
+  const steps = [
+    { do: 'click', ref: 'e3' },
+    { do: 'type', ref: 'e5', text: '私信正文不能落盘' },
+    { do: 'click', find: { role: 'button', name: '发送' } },
+  ];
+  const recipe = toRecipe(steps, { e3: { role: 'button', name: '私信' }, e5: { role: 'textbox', name: '消息' } });
+  assert.deepEqual(recipe[0], { do: 'click', find: { role: 'button', name: '私信' } });
+  assert.equal(recipe[1].text, '{{消息}}');
+  assert.doesNotMatch(JSON.stringify(recipe), /私信正文/);
+});
+
+test('有无名元素、少于 3 步、或全是读操作的 act 不沉淀', () => {
+  const three = [{ do: 'click', ref: 'e1' }, { do: 'click', ref: 'e2' }, { do: 'click', ref: 'e3' }];
+  assert.equal(toRecipe(three, { e1: { role: 'button', name: 'a' }, e2: { role: 'button', name: '' }, e3: { role: 'button', name: 'c' } }), null);
+  assert.equal(toRecipe(three.slice(0, 2), {}), null);
+  assert.equal(toRecipe([{ do: 'read', contains: 'x' }, { do: 'wait', for: 'idle' }, { do: 'scroll', to: 'bottom' }], {}), null);
+});
+
+test('草稿：同样步骤再跑通只记次数；adopt 后进经验且列在最前', () => {
+  const steps = [{ do: 'click', find: { role: 'button', name: '写笔记' } }, { do: 'type', find: { role: 'textbox', name: '标题' }, text: '{{标题}}' }, { do: 'click', find: { role: 'button', name: '存草稿' } }];
+  const a = saveDraft('https://creator.draft.example/publish?token=secret', steps);
+  const b = saveDraft('https://creator.draft.example/publish', steps);
+  assert.equal(a.id, b.id);
+  assert.equal(b.runs, 2);
+  const before = getLearnings('draft.example');
+  assert.match(before, /待确认的剧本草稿/);
+  assert.doesNotMatch(before, /secret/);           // 起点只留 host+path
+  assert.match(adoptDraft('draft.example', a.id, '存一篇笔记草稿'), /已收录/);
+  const after = getLearnings('draft.example');
+  assert.match(after, /可直接运行的剧本：「存一篇笔记草稿」/);
+  assert.doesNotMatch(after, /待确认的剧本草稿/);
+  assert.deepEqual(lintPlaybooks(after), []);
 });

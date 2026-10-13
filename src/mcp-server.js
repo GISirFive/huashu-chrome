@@ -10,11 +10,12 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprot
 import { BridgeClient } from './lib/rpc.js';
 import { resolveHost } from './lib/host.js';
 import { flatCount } from '../extension/script.js';
-import { getLearnings, saveLearnings } from './lib/learnings.js';
+import { getLearnings, saveLearnings, saveDraft, adoptDraft } from './lib/learnings.js';
 import { audit } from './lib/paths.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import { VERSION } from './lib/version.js';
+import { compat, compatNote } from '../extension/compat.js';
 
 const REF = { type: 'string', description: 'Element ref from the latest snapshot, e.g. "e3"' };
 const SNAP = { type: 'string', description: 'snapshotId the ref came from' };
@@ -163,11 +164,15 @@ const TOOLS = [
   {
     name: 'read_text',
     description:
-      'Extract the main readable content of the page as markdown, with boilerplate stripped. ' +
-      'Use for reading articles/docs; use snapshot when you need to interact.',
+      'Main readable content as markdown. scope:"page" = all rendered text ' +
+      '(not eval innerText). snapshot to interact.',
     inputSchema: {
       type: 'object',
-      properties: { tabId: TAB, format: { type: 'string', enum: ['markdown', 'text'] } },
+      properties: {
+        tabId: TAB,
+        format: { type: 'string', enum: ['markdown', 'text'] },
+        scope: { type: 'string', enum: ['main', 'page'] },
+      },
     },
   },
   {
@@ -444,8 +449,8 @@ const TOOLS = [
   {
     name: 'eval',
     description:
-      'Run a JS expression in the page. NOTE: fails on any site with a strict CSP (no unsafe-eval) — most large sites. ' +
-      'Prefer `query` for data extraction. Isolated world: sees the DOM, not the page\'s own JS variables.',
+      'Run JS in the page (sees its vars): expression or statements, last value returned, promises awaited ' +
+      '(with `await`, `return` it). Prefer `query`/`read_text`.',
     inputSchema: {
       type: 'object',
       properties: { expr: { type: 'string' }, tabId: TAB },
@@ -456,14 +461,16 @@ const TOOLS = [
     name: 'learnings',
     description:
       'Site notes: APIs, walls, pitfalls from past sessions. Call {domain} before first acting on a site ' +
-      '(no args = list sites). Notes may embed runnable ```act scripts — fill {{placeholders}} and run them ' +
-      'instead of rediscovering. Learned something non-obvious or mapped a flow? Save the full note ' +
-      'back via {domain, save}. Hints, never rules.',
+      '(no args = list sites). Runnable ```act playbooks come first: fill {{placeholders}}, run. ' +
+      'Learned something non-obvious? Save the full note via {domain, save}. Completed acts become drafts; ' +
+      'keep one: {domain, adopt, name}. Hints, never rules.',
     inputSchema: {
       type: 'object',
       properties: {
         domain: { type: 'string', description: 'Domain or URL' },
         save: { type: 'string', description: 'Full note markdown; replaces the local note, merge with get() first' },
+        adopt: { type: 'string' },
+        name: { type: 'string' },
       },
     },
   },
@@ -559,8 +566,9 @@ export async function startMcpServer({ client = 'unknown' } = {}) {
       // learnings 是纯本地读写，不需要浏览器在线。但要进审计：它不经过桥，
       // 以前一条都不记，「LEARNINGS FIRST 到底有没有人遵守」就成了量不了的事。
       if (name === 'learnings') {
-        const text = args.save != null ? saveLearnings(args.domain, args.save) : getLearnings(args.domain);
-        audit({ ev: 'cmd', id: `local:${Date.now()}`, cmd: 'learnings', client: bridge.client, sid: bridge.sessionId, params: { domain: args.domain, save: args.save != null ? `<${String(args.save).length}字>` : undefined } });
+        const text = args.adopt ? adoptDraft(args.domain, args.adopt, args.name)
+          : args.save != null ? saveLearnings(args.domain, args.save) : getLearnings(args.domain);
+        audit({ ev: 'cmd', id: `local:${Date.now()}`, cmd: 'learnings', client: bridge.client, sid: bridge.sessionId, params: { domain: args.domain, save: args.save != null ? `<${String(args.save).length}字>` : undefined, adopt: args.adopt } });
         return { content: [{ type: 'text', text }] };
       }
 
@@ -662,24 +670,39 @@ export async function startMcpServer({ client = 'unknown' } = {}) {
         fs.writeFileSync(args.savePath, Buffer.from(data.base64, 'base64'));
         return { content: [{ type: 'text', text: `已保存 ${Math.round(data.bytes / 1024)}KB (${data.ct}) → ${args.savePath}` }] };
       }
-      const body = data.untrusted
+      // act 完整跑通 → 落一份剧本草稿（扩展已把 ref 换成 find、输入换成占位符）
+      let draftNote = '';
+      if (name === 'act' && data?.recipe) {
+        try {
+          const d = saveDraft(data.recipeFrom, data.recipe);
+          if (d) {
+            draftNote = `\n\n💾 这段流程已存为剧本草稿 ${d.id}（${d.key}${d.runs > 1 ? `，同样的步骤已跑通 ${d.runs} 次` : ''}）。`
+              + `以后还会用到的话：learnings({domain:"${d.key}", adopt:"${d.id}", name:"…"}) 收进经验，下次一条 act 跑完。`;
+          }
+        } catch { /* 草稿存不下不影响这次 act 的结果 */ }
+        delete data.recipe; delete data.recipeFrom;
+      }
+      const body = (data.untrusted
         ? wrapUntrusted(data.text, data.meta)
-        : (typeof data === 'string' ? data : data.text ?? JSON.stringify(data));
+        : (typeof data === 'string' ? data : data.text ?? JSON.stringify(data))) + draftNote;
       return { content: [{ type: 'text', text: body + mismatchNote() }] };
     } catch (e) {
-      return { content: [{ type: 'text', text: hint(e) + mismatchNote() }], isError: true };
+      return { content: [{ type: 'text', text: hint(e) + mismatchNote(true) }], isError: true };
     }
   });
 
-  // 扩展和 CLI 版本对不上，以前只有 bridge.log 知道（22 条记录，没人看）。
-  // npx 会原地刷新扩展文件、Chrome 跑的还是旧 SW，新协议在旧扩展上就是
-  // 「莫名其妙的行为」。在回执里说一次——回执是唯一不被截断、一定有人读的通道。
+  // 扩展和本地端版本对不上时在回执里说一次——回执是唯一一定有人读的通道。
+  // 分级见 extension/compat.js：补丁号差异静默；本地端旧了提一次怎么升级；
+  // 扩展旧了只在出错时提（它多半几小时内就自动更新了，平时说了也只是吓人）。
+  // 用本进程自己的版本算，不信桥给的结论——桥可能是别的版本拉起来的。
   let mismatchSaid = false;
-  function mismatchNote() {
-    if (mismatchSaid || !bridge.versionMismatch) return '';
+  function mismatchNote(failed = false) {
+    if (mismatchSaid || !bridge.extensionVersion) return '';
+    const level = compat({ ext: bridge.extensionVersion, cli: VERSION, extProtocol: bridge.extensionProtocol });
+    if (level === 'same' || level === 'patch') return '';
+    if (level === 'ext-old' && !failed) return '';
     mismatchSaid = true;
-    return `\n\n⚠️ Chrome 扩展是 v${bridge.extensionVersion}，CLI 是 v${VERSION}——两边协议可能对不上。`
-      + '让用户点扩展图标 → 「重连」；不行再去 chrome://extensions 点重载（npx 已把文件更新到位，Chrome 跑的还是旧的）。';
+    return `\n\n⚠️ ${compatNote(level, { ext: bridge.extensionVersion, cli: VERSION })}`;
   }
 
   await server.connect(new StdioServerTransport());
@@ -758,7 +781,9 @@ function hint(e) {
     REF_NOT_FOUND: '这个 ref 在页面上找不到了。重新 snapshot。',
     NOT_INTERACTABLE: '元素当前不可点（被遮挡、隐藏或 disabled）。先 wait，或换一个目标。',
     NEEDS_CONFIRM: '这是敏感操作，需要用户在浏览器里确认。把要做的事告诉用户，等他点确认。',
-    DIALOG_BLOCKING: '页面上有 alert/confirm 弹窗挡着，所有浏览器命令都会卡住。让用户先手动关掉。',
+    DIALOG_BLOCKING: '确认页面上开着对话框（原文见上）。用 ask 把原文告诉用户、请他处理；别原样重试，同一条路一样会挂住。',
+    PAGE_BUSY: '没有对话框，页面只是忙。别打扰用户——数据改走 network / fetch，操作稍后重试一次。',
+    TAB_DISCARDED: '标签页被 Chrome 回收了。navigate(action:"reload") 后重做这一步。',
     NO_TAB: '没有可用的标签页。先用 tabs(action:"new", url:…) 开一个。',
     TIMEOUT: '浏览器侧超时。页面可能还在加载——先 wait 再重试。',
     NEEDS_L2: '这一步需要真实输入事件，但高保真模式被关了。让用户点开 huashu-chrome 扩展图标，'

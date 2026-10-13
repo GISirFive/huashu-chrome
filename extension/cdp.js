@@ -313,6 +313,13 @@ async function pinViewport(cmd) {
   };
 }
 
+// 后台标签页不出帧：rAF 不跑、IntersectionObserver 不回调，靠它们水合的页面停在骨架屏
+// （经验库约 18 个站记过「骨架，不是未登录」）。截一帧会推一次渲染管线——agent 的绕法
+// 就是「先截个图」，这里做成内建的，结果丢掉不用。
+export async function forceFrame(tabId) {
+  await screenshot(tabId);
+}
+
 export async function screenshot(tabId, { full = false } = {}) {
   return withL2(tabId, async (cmd) => {
     const s = sessions.get(tabId);
@@ -339,14 +346,21 @@ export async function screenshot(tabId, { full = false } = {}) {
 
 // 不受页面 CSP 管的求值。现在的 eval 走 MAIN world，大站的 CSP 一律拦下——
 // 这条路是调试器的求值通道，CSP 管不着。
-export async function evaluate(tabId, expression, { maxLength = 20000 } = {}) {
+export async function evaluate(tabId, src, { maxLength = 20000 } = {}) {
   return withL2(tabId, async (cmd) => {
-    const r = await cmd('Runtime.evaluate', {
+    const run = (expression, extra = {}) => cmd('Runtime.evaluate', {
       expression,
       returnByValue: true,
       awaitPromise: true,
       userGesture: true,   // 剪贴板、全屏这类要用户手势的 API 靠这个解锁
+      ...extra,
     });
+    // 和页面世界那条路同样的两档：先当表达式（对象字面量要括号），
+    // 语法不对再按语句跑——replMode 顺带允许顶层 await，和 DevTools 控制台一样
+    let r = await run(`(${src})`);
+    if (r.exceptionDetails && /SyntaxError/.test(r.exceptionDetails.exception?.description || r.exceptionDetails.text || '')) {
+      r = await run(src, { replMode: true });
+    }
     if (r.exceptionDetails) {
       const msg = r.exceptionDetails.exception?.description || r.exceptionDetails.text;
       throw new L2Unavailable(`表达式执行失败：${msg}`, 'INTERNAL');
@@ -399,6 +413,22 @@ wireDebuggerEvents();
 chrome.permissions?.onAdded?.addListener(wireDebuggerEvents);
 
 export const pendingDialog = (tabId) => dialogs.get(tabId) || null;
+
+// 超时诊断用：页面脚本不应答时，确认到底有没有对话框。没 attach 时弹出来的框
+// 我们收不到事件——attach 时的 Page.enable 会让 Chrome 把已经开着的框补发一次
+// javascriptDialogOpening，所以挂上后稍等片刻就知道答案。
+export async function probeDialog(tabId, ms = 400) {
+  if (dialogs.has(tabId)) return dialogs.get(tabId);
+  await withL2(tabId, async () => {});
+  await new Promise((r) => setTimeout(r, ms));
+  return dialogs.get(tabId) || null;
+}
+
+// 后台标签页被 Chrome 冻结（Tab.frozen）时，内容脚本收不到任何消息，
+// 表现和弹窗一模一样。CDP 能把它拉回 active。
+export async function unfreeze(tabId) {
+  await withL2(tabId, (cmd) => cmd('Page.setWebLifecycleState', { state: 'active' }));
+}
 
 // 弹窗只能由人决定接不接受——扩展替用户点「确定」，等于替他做了那个决定。
 // 所以这里只提供把它关掉的能力，默认走 dismiss（相当于点「取消」），

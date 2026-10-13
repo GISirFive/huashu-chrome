@@ -261,6 +261,14 @@ test('点击毫无反应时，明确报出来，而不是回一份看着正常�
   assert.match(r.text, /没有反应|没有可归因于这次操作的变化/);
 });
 
+test('只发请求不改页面的点击：报出请求，不判「没反应」，也不自动再点一次', async () => {
+  await go();
+  const r = await c.call('click', { selector: '#favBtn' });
+  assert.match(r.text, /POST \/delay/);
+  assert.doesNotMatch(r.text, /操作已发出，但页面完全没有反应/);
+  assert.doesNotMatch(r.text, /已自动改用真实事件/);
+});
+
 test('焦点落到目标自己身上不算「页面有反应」', async () => {
   await go();
   // 点击必然让目标获得焦点（L1 显式 focus，L2 由浏览器聚焦），
@@ -1202,4 +1210,42 @@ test('截图默认 60% JPEG，full 才是 1:1 PNG', async (t) => {
   const full = await c.call('screenshot', { full: true });
   assert.match(full.dataUrl, /^data:image\/png/);
   assert.ok(full.dataUrl.length > small.dataUrl.length * 1.5, `全尺寸 PNG 应明显更大：${full.dataUrl.length} vs ${small.dataUrl.length}`);
+});
+
+// ---------- v1.3：少回合 ----------
+
+test('跑通的 act 带回可复用剧本：ref 换成 find，输入换成占位符', async () => {
+  await flow();
+  await c.call('click', { find: { role: 'button', name: '开始填写' } });
+  const snap = await c.call('snapshot', {});
+  const refOf = (name) => new RegExp(`\\[(e\\d+)\\]\\s+\\S+\\s+"${name}"`).exec(snap.text)[1];
+  const r = await c.call('act', {
+    snapshotId: snap.snapshotId,
+    steps: [
+      { do: 'type', ref: refOf('手机号'), text: '13900139000' },
+      { do: 'type', ref: refOf('收件人'), text: '花叔' },
+      { do: 'read', contains: '收件人' },
+    ],
+  });
+  assert.ok(r.recipe, '完整跑通的 act 应带回剧本');
+  assert.deepEqual(r.recipe[0].find, { role: 'textbox', name: '手机号' });
+  assert.equal(r.recipe[1].text, '{{收件人}}');
+  assert.doesNotMatch(JSON.stringify(r.recipe), /13900139000|花叔/);
+});
+
+test('eval 接受语句序列和顶层 await，不用自己包 IIFE', async () => {
+  await go();
+  const a = await c.call('eval', { expr: 'const n = document.querySelectorAll("button").length; n > 0' });
+  assert.match(a.text, /true/);
+  const b = await c.call('eval', { expr: 'const r = await fetch("delay?ms=50"); return r.status' });
+  assert.match(b.text, /200/);
+  const d = await c.call('eval', { code: '1 + 1' });
+  assert.match(d.text, /2/);
+});
+
+test('read_text scope:page 给整页渲染文本，块与块之间有换行', async () => {
+  await go();
+  const r = await c.call('read_text', { scope: 'page', format: 'text' });
+  assert.match(r.text, /huashu-chrome 靶场/);
+  assert.ok((r.text.match(/\n/g) || []).length > 20, '整页文本应保留换行，不能挤成一行');
 });

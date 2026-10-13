@@ -201,6 +201,7 @@
   </p>
   <p>
     <button id="slowBtn">慢反应按钮</button> <b id="slowOut">未完成</b>
+    <button id="favBtn">收藏</button>
     <small>点下去先加 class，350ms 后才改文字——效果证据不能在第一拍就走</small>
   </p>
   <p>
@@ -358,6 +359,9 @@ document.getElementById('slowBtn').onclick = function () {
   // 定时器会被 Chrome 对齐到整秒甚至更久，350ms 根本到不了；网络回调不受那条节流管
   fetch('delay?ms=350').then(() => { document.getElementById('slowOut').textContent = '已经完成了（异步）'; });
 };
+// 只发请求、页面不变：点赞、收藏、存草稿都长这样。DOM 证据为零，
+// 以前会被判「完全没有反应」，还会被自动用真实事件再点一次——对来回切换的按钮那就是撤销
+document.getElementById('favBtn').onclick = () => { fetch('delay?ms=150', { method: 'POST', body: 'fav=1' }); };
 document.getElementById('openDlg').onclick = () => document.getElementById('dlg').classList.remove('hidden');
 document.getElementById('dlgClose').onclick = () => document.getElementById('dlg').classList.add('hidden');
 document.getElementById('chk').onclick = function () { this.classList.toggle('is-checked'); };

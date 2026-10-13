@@ -14,7 +14,23 @@ import { VERSION } from './lib/version.js';
 import { scrubProse } from '../extension/redact.js';
 
 export { VERSION };
-const PROTOCOL = 1;
+
+// 写操作回执的效果分类进审计。以前 res 只有 ok/ms/bytes/error，
+// 「回执说没反应、其实已提交」这类误判有多少、修完降了多少，都量不出来。
+// 只取类别，不存回执正文。
+export function effectOf(data) {
+  const t = typeof data === 'string' ? data : data?.text;
+  if (typeof t !== 'string') return undefined;
+  const head = t.slice(0, 1200);
+  if (/^act 停在/m.test(head)) return 'act-stopped';
+  if (/^act 完成/m.test(head)) return data?.recipe ? 'act-done+draft' : 'act-done';
+  if (/操作已发出，但页面完全没有反应/.test(head)) return 'none';
+  if (/没有可归因于这次操作的变化/.test(head)) return 'unattributable';
+  if (/发出了请求：/.test(head)) return 'request-only';
+  if (/^效果：/m.test(head)) return /^请求：/m.test(head) ? 'changed+request' : 'changed';
+  return undefined;
+}
+import { PROTOCOL, compat, compatNote } from '../extension/compat.js';
 const HELLO_TIMEOUT = 5000;
 const CMD_TIMEOUT = 30000;
 const IDLE_EXIT_MS = 30 * 60 * 1000; // 半小时没人用就自己退，别留僵尸进程
@@ -194,6 +210,7 @@ export function startBridge({ port = DEFAULT_PORT, token = newToken(), writeInfo
       if (!ws.isExtension) return ws.close(4003, 'role/origin mismatch');
       ws.helloed = true;
       ws.extVersion = msg.version || '?';
+      ws.extProtocol = msg.v ?? PROTOCOL;
       ws.chromeVersion = msg.chrome || '?';
       ws.headless = !!msg.headless;
       // 老扩展不报 instanceId。退回按扩展 id 认——行为和单槽那版一样
@@ -212,9 +229,9 @@ export function startBridge({ port = DEFAULT_PORT, token = newToken(), writeInfo
 
       // 改了扩展代码却忘记去 chrome://extensions 重载，是这类产品最高频的故障，
       // 症状还都是些莫名其妙的行为。这里把它变成一句明确的话。
-      if (ws.extVersion !== VERSION) {
-        log(`⚠️  版本不一致：扩展 ${ws.extVersion} vs 桥 ${VERSION} —— 去 chrome://extensions 重载扩展`);
-      }
+      // 补丁号不同不再报：两边协议没变就是兼容的（判定见 extension/compat.js）
+      const level = compat({ ext: ws.extVersion, cli: VERSION, extProtocol: ws.extProtocol });
+      if (level !== 'same' && level !== 'patch') log(`⚠️  ${compatNote(level, { ext: ws.extVersion, cli: VERSION })}`);
       log(`扩展已连接（${extLabel(ws)}）`);
       // 多实例不再是故障，但仍然值得说一声：命令只会去其中一个，
       // 而「为什么我的命令跑到另一个 Chrome 里去了」全靠这行日志才查得到。
@@ -250,7 +267,9 @@ export function startBridge({ port = DEFAULT_PORT, token = newToken(), writeInfo
         type: 'welcome', bridge: VERSION, v: PROTOCOL,
         extensionOnline: !!ext,
         extensionVersion: ext?.extVersion,
-        versionMismatch: !!ext && ext.extVersion !== VERSION,
+        // 老 MCP 只认 versionMismatch：只在真需要人处理时置位，补丁号差异不再惊动它
+        versionMismatch: !!ext && !['same', 'patch'].includes(compat({ ext: ext.extVersion, cli: VERSION, extProtocol: ext.extProtocol })),
+        extensionProtocol: ext?.extProtocol,
         // 多实例是诊断信息，不是故障。doctor 要能说出「有两个 Chrome 连着」，
         // 否则「命令跑到另一个窗口去了」这种事只能靠猜。
         extensions: liveExtensions().map((e) => ({
@@ -360,7 +379,7 @@ export function startBridge({ port = DEFAULT_PORT, token = newToken(), writeInfo
       // bytes：回执体积。回合空档中位从 5.3s 涨到 9.9s，怀疑是上下文变重，
       // 而审计里没有任何一个字段能证实或证伪——没有量就没法治。
       audit({ ev: 'res', id: key, cmd: p.cmd, ok: msg.ok, ms: Date.now() - p.startedAt, error: msg.error?.code,
-        bytes: msg.ok ? JSON.stringify(msg.data ?? '').length : undefined });
+        bytes: msg.ok ? JSON.stringify(msg.data ?? '').length : undefined, effect: msg.ok ? effectOf(msg.data) : undefined });
       const { __k, ...clean } = msg;
       send(p.agent, clean);
       return;

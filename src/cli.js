@@ -9,6 +9,8 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { readBridgeInfo, DEFAULT_PORT, HOME, AUDIT_FILE, LOG_FILE } from './lib/paths.js';
+import { VERSION } from './lib/version.js';
+import { compat, compatNote } from '../extension/compat.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(HERE, '..');
@@ -170,7 +172,11 @@ async function doctor() {
     {
       const r = await probe(info);
       r.ok ? ok(`握手正常${r.extensionOnline ? ` · Chrome 扩展在线 (v${r.extensionVersion})` : ''}`) : bad('握手失败：' + r.error);
-      if (r.versionMismatch) bad(`扩展版本 ${r.extensionVersion} 和 CLI 不一致`, '去 chrome://extensions 点重载，再刷新目标页面');
+      if (r.extensionVersion) {
+        const level = compat({ ext: r.extensionVersion, cli: VERSION, extProtocol: r.extensionProtocol });
+        if (level === 'protocol' || level === 'ext-old' || level === 'cli-old') bad(compatNote(level, { ext: r.extensionVersion, cli: VERSION }));
+        else if (level === 'patch') ok(`扩展 v${r.extensionVersion} / 本地端 v${VERSION}：只差补丁号，互相兼容`);
+      }
       // 多个 Chrome 实例连着不再是故障（桥按实例路由），但必须说出来：
       // 「命令为什么跑到另一个窗口去了」只有这一处看得见。
       if ((r.extensions || []).length > 1) {
@@ -305,6 +311,18 @@ function auditStats(days) {
     console.log('\n错误 Top 8');
     for (const [k, n] of [...errs.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8)) console.log(`  ${k.padEnd(28)} ${n}`);
   }
+  // 1.3 起写操作回执带效果类别：none（真没反应）该越来越少，request-only 是以前会被误判的那批
+  const eff = new Map();
+  for (const r of cmds) { const e = res.get(r)?.effect; if (e) eff.set(e, (eff.get(e) || 0) + 1); }
+  if (eff.size) {
+    console.log('\n写操作效果（1.3 起记录）');
+    for (const [k, n] of [...eff.entries()].sort((a, b) => b[1] - a[1])) console.log(`  ${k.padEnd(18)} ${n}`);
+  }
+  const lrn = cmds.filter((r) => r.cmd === 'learnings');
+  if (lrn.length) {
+    const adopt = lrn.filter((r) => r.params?.adopt).length, save = lrn.filter((r) => r.params?.save).length;
+    console.log(`\nlearnings ${lrn.length} 次 · 写回 ${save} · 剧本入库 ${adopt}`);
+  }
   console.log('');
 }
 
@@ -319,7 +337,7 @@ function probe(info) {
       const m = JSON.parse(ev.data);
       ws.close();
       resolve(m.type === 'welcome'
-        ? { ok: true, extensionOnline: m.extensionOnline, extensionVersion: m.extensionVersion, versionMismatch: m.versionMismatch, extensions: m.extensions || [] }
+        ? { ok: true, extensionOnline: m.extensionOnline, extensionVersion: m.extensionVersion, extensionProtocol: m.extensionProtocol, versionMismatch: m.versionMismatch, extensions: m.extensions || [] }
         : { ok: false, error: JSON.stringify(m) });
     };
   });

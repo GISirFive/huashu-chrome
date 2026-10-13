@@ -99,6 +99,7 @@ export class BridgeClient {
           this.extensionOnline = !!msg.extensionOnline;
           this.extensionVersion = msg.extensionVersion;
           this.versionMismatch = !!msg.versionMismatch;
+          this.extensionProtocol = msg.extensionProtocol;
           ws.onmessage = (e2) => this.#dispatch(JSON.parse(e2.data));
           ws.onclose = () => { this.ws = null; this.#failAll('桥连接已断开'); };
           ws.onerror = () => {};
