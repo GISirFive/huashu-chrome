@@ -111,3 +111,12 @@ token 算法：`((id/1e15)*Math.PI).toString(36)` 去掉 `0` 和 `.`。
 ## 其他
 
 - `tabs new` 曾返回一个错误的 tabId；用 `tabs list` 找一个现成的 x.com tab 再 navigate 更稳。
+
+
+## 2026-10-06：Quote视频原生排期与CLI视频MIME
+
+来源：花叔穿越名画/发布/英文夜间推广，X真实Chrome本机v1.2.1实测。Quote可同时有文章卡片、MP4及原生定时；普通独立视频帖也可定时。Schedule面板5个select依次月/日/年/时/分，当次显示China Standard Time；Confirm只确认时间，composer最终Schedule才创建服务端任务。FetchScheduledTweets读取scheduled_tweet_list的rest_id、scheduling_info.execute_at/state、tweet_create_request.status/attachment_url/media_ids及media_entities.media_info.duration_millis，新标签页刷新后核对。scheduled_id不等于公开tweet ID。
+
+旧CLI upload对MP4发application/octet-stream，回执「投入」而X不显示媒体、不发上传请求；MCP upload已支持path＋video/mp4，复用其BridgeClient/CDP直接读盘路径后出现Uploading/Processing/Ready并可定时。不要用「投入」回执替代附件Ready。路径见该项目上传视频.mjs，未修改CLI。
+
+act.select当前值再设同值会判无变化而停止后续批处理；先读value，仅发送变化字段。后台compose/schedule模态框有时超过30秒才完整出现；wait超时先eval读现场恢复，不重复重开有内容的composer。Draft.js编辑器innerText在空段处会多一换行，最终服务端status保留原文2换行，以服务端正文为准。
