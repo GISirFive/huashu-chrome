@@ -102,6 +102,14 @@
 
   <section>
     <h2>设置</h2>
+    <div class="sw-row" style="display:flex;flex-direction:column;align-items:stretch;gap:6px">
+      <div class="txt">桥地址<div class="sub">默认 127.0.0.1（与浏览器同机）。跨容器、跨 WSL 改成桥跑的那台机器可达的 IP 或主机名（如 WSL 的 eth0 地址）</div></div>
+      <div style="display:flex;gap:6px;align-items:center">
+        <input type="text" id="bridgeHost" placeholder="127.0.0.1" style="flex:1;font:inherit;padding:5px 8px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--ink)" />
+        <button class="btn" id="bridgeHostSave">保存</button>
+      </div>
+      <div class="sub" id="bridgeHostHint" style="display:none"></div>
+    </div>
     <label class="sw-row">
       <span class="txt">高保真模式<div class="sub">需要时用浏览器级真实输入，应付严格的站点和富文本编辑器；用完自动断开</div></span>
       <input type="checkbox" class="toggle" id="l2" />

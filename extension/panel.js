@@ -203,6 +203,34 @@ $('reconn').onclick = async () => {
 
 // ---------- 设置 ----------
 
+// 桥地址：默认 127.0.0.1，跨容器/跨 WSL 时改成桥所在机器的 IP（例如 WSL 的 eth0 地址）。
+// 配置只通过 SW 转发给 chrome.storage，侧栏不直接动 storage——避免两路写入互相覆盖。
+async function loadBridgeHost() {
+  const r = await send({ __hcBridge: 'config' }).catch(() => null);
+  $('bridgeHost').value = r?.host || '127.0.0.1';
+  $('bridgeHostHint').style.display = 'none';
+}
+loadBridgeHost();
+
+$('bridgeHostSave').onclick = async () => {
+  const v = $('bridgeHost').value.trim() || '127.0.0.1';
+  $('bridgeHostSave').disabled = true;
+  const r = await send({ __hcBridge: 'setConfig', host: v });
+  $('bridgeHostSave').disabled = false;
+  const hint = $('bridgeHostHint');
+  if (r?.ok) {
+    hint.style.display = '';
+    hint.style.color = 'var(--ok)';
+    hint.textContent = `已保存 ${r.host}，正在重连…`;
+  } else {
+    hint.style.display = '';
+    hint.style.color = 'var(--bad)';
+    hint.textContent = '保存失败：' + (r?.error || '未知');
+  }
+  setTimeout(() => { hint.style.display = 'none'; }, 4000);
+  refreshAll();
+};
+
 chrome.storage.local.get('l2Disabled', ({ l2Disabled }) => { $('l2').checked = !l2Disabled; });
 
 $('l2').onchange = async (e) => {

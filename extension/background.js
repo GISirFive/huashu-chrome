@@ -26,6 +26,18 @@ import { validateScript, condText, repeatMax, EXEC_BUDGET, collectRefs, toRecipe
 // 连唤醒用的 alarm 都可能没重建。结果是扩展彻底哑掉，一声不响，
 // 桥那边永远显示「扩展没连上」。整个产品的连通性不能挂在一个单点上。
 
+// 桥跑哪台机器。默认 127.0.0.1；跨容器/跨 WSL 场景（WSL 里跑桥、Windows 里跑 Chrome）
+// 由用户在侧栏里配成 WSL 的 eth0 IP。值存 chrome.storage.local，键名 hcBridgeHost。
+async function getBridgeHost() {
+  try {
+    const { hcBridgeHost } = await chrome.storage.local.get('hcBridgeHost');
+    const v = (hcBridgeHost || '').trim();
+    return v || '127.0.0.1';
+  } catch {
+    return '127.0.0.1';
+  }
+}
+
 let ensuring = null;
 let offscreenFailed = null;   // 记下原因，doctor 和 popup 要能说清为什么走了兜底
 
@@ -197,10 +209,11 @@ async function directConnect() {
   // 两条腿必须报同一个 instanceId：桥认的是实例不是连接，报岔了
   // 就会被当成两个 Chrome 并存，谁也不替换谁。
   const iid = await instanceId();
+  const host = await getBridgeHost();
   for (const port of PORTS) {
     try {
       directWs = await new Promise((resolve, reject) => {
-        const sock = new WebSocket(`ws://127.0.0.1:${port}`);
+        const sock = new WebSocket(`ws://${host}:${port}`);
         const t = setTimeout(() => { sock.close(); reject(new Error('timeout')); }, 1500);
         sock.onopen = () => sock.send(JSON.stringify({
           type: 'hello', role: 'extension', extId: chrome.runtime.id,
@@ -2761,6 +2774,23 @@ chrome.runtime.onMessage.addListener((m, sender, sendResponse) => {
       headless: isHeadless(),
     }));
     return true;   // 异步回答，通道要留着
+  }
+  // offscreen 拿不到 chrome.storage，桥地址托这边查
+  if (m?.__hcBridge === 'config') {
+    getBridgeHost().then((host) => sendResponse({ host }));
+    return true;
+  }
+  // 侧栏里改了桥地址：落盘 + 立刻重连
+  if (m?.__hcBridge === 'setConfig' && typeof m.host === 'string') {
+    (async () => {
+      const host = m.host.trim() || '127.0.0.1';
+      await chrome.storage.local.set({ hcBridgeHost: host });
+      // 踢一下让 offscreen 用新地址重连；SW 兜底连接同样断掉让它按新地址重试
+      try { directWs?.close(); } catch { /* 已经断了 */ }
+      await chrome.runtime.sendMessage({ __hcBridge: 'kick' }).catch(() => {});
+      sendResponse({ ok: true, host });
+    })();
+    return true;
   }
   // 同理，它也够不着 chrome.storage，连接状态托这边落盘
   if (m?.__hcBridge === 'status') {

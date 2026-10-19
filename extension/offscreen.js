@@ -44,9 +44,9 @@ function scheduleReconnect() {
 
 // 五个端口**并行**探，不是挨个等。串行时每个端口 1.5 秒，全试一遍最坏 7.5 秒，
 // 而这 7.5 秒里 agent 只能干等——桥其实往往就在第二个端口上。
-function probe(port, hello) {
+function probe(port, host, hello) {
   return new Promise((resolve, reject) => {
-    const sock = new WebSocket(`ws://127.0.0.1:${port}`);
+    const sock = new WebSocket(`ws://${host}:${port}`);
     const t = setTimeout(() => { try { sock.close(); } catch { /* 已经废了 */ } reject(new Error('timeout')); }, PROBE_MS);
     const die = () => { clearTimeout(t); try { sock.close(); } catch { /* 已经废了 */ } reject(new Error('rejected')); };
 
@@ -82,12 +82,20 @@ async function askIdentity() {
   return r?.extId ? r : null;
 }
 
+// 桥地址同样只在 SW 里能读到（offscreen 没 chrome.storage）。
+// 默认 127.0.0.1；跨容器/跨 WSL 时 SW 那一侧已读过用户配置的 hcBridgeHost。
+async function askHost() {
+  const r = await chrome.runtime.sendMessage({ __hcBridge: 'config' }).catch(() => null);
+  return r?.host || '127.0.0.1';
+}
+
 async function connect() {
   if (connecting || ws?.readyState <= 1) return;
   connecting = true;
   try {
     const who = await askIdentity();
     if (!who) { setStatus(false); return scheduleReconnect(); }
+    const host = await askHost();
     const hello = {
       type: 'hello',
       role: 'extension',
@@ -102,7 +110,7 @@ async function connect() {
     };
 
     let winner = null;
-    const races = PORTS.map((p) => probe(p, hello).then((r) => {
+    const races = PORTS.map((p) => probe(p, host, hello).then((r) => {
       // 只留第一个握上手的，其余当场关掉——不关的话桥那边会看到
       // 四条多余的扩展连接，而桥「同时只认一个扩展」，后来者会把前一个踢掉
       if (winner) { try { r.sock.close(); } catch { /* 已经废了 */ } return null; }

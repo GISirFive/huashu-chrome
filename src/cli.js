@@ -29,7 +29,11 @@ switch (cmd) {
 
   case 'bridge': {
     const { startBridge } = await import('./bridge.js');
-    startBridge({ port: Number(flag('--port', DEFAULT_PORT)), foreground: has('--foreground') });
+    startBridge({
+      port: Number(flag('--port', DEFAULT_PORT)),
+      host: flag('--host', process.env.HUASHU_HOST || '127.0.0.1'),
+      foreground: has('--foreground'),
+    });
     break;
   }
 
@@ -132,6 +136,8 @@ switch (cmd) {
   huashu-chrome audit [-n 30]  看最近的浏览器操作记录
   huashu-chrome audit --stats [--days 7]   真实 agent 的用法统计：回合数、哪类调用最多、在哪儿浪费
   huashu-chrome bridge --foreground   前台跑桥（调试用）
+  huashu-chrome bridge --host 0.0.0.0   桥绑到所有接口（跨容器/跨 WSL 用；默认 127.0.0.1 只本机）
+                                       也可用 HUASHU_HOST=0.0.0.0 环境变量，让 doctor/mcp 自动拉桥时同样生效
   huashu-chrome install --dry-run     只看会改哪些配置，不写
 
 配置目录 ${HOME}`);

@@ -40,7 +40,7 @@ const ORPHAN_GRACE_MS = 15000;       // 扩展断开时在途命令的宽限：�
 
 // writeInfo=false 供测试用：不写 bridge.json，否则测试桥的 token 会盖掉
 // 真在跑的那个桥，用户所有 agent 会话当场断连。
-export function startBridge({ port = DEFAULT_PORT, token = newToken(), writeInfo = true, orphanGraceMs = ORPHAN_GRACE_MS,
+export function startBridge({ port = DEFAULT_PORT, host = '127.0.0.1', token = newToken(), writeInfo = true, orphanGraceMs = ORPHAN_GRACE_MS,
   silenceMs = EXT_SILENCE_MS, probeMs = EXT_PROBE_MS, tickMs = 20000 } = {}) {
   ensureHome();
 
@@ -114,7 +114,7 @@ export function startBridge({ port = DEFAULT_PORT, token = newToken(), writeInfo
   const extLabel = (ws) => `Chrome ${ws.chromeVersion || '?'}${ws.headless ? ' · headless' : ''} · 扩展 ${ws.extVersion}`;
 
   const wss = new WebSocketServer({
-    host: '127.0.0.1',
+    host,
     port,
     verifyClient: (info, done) => {
       const origin = info.req.headers.origin;
@@ -424,8 +424,8 @@ export function startBridge({ port = DEFAULT_PORT, token = newToken(), writeInfo
 
   const ready = new Promise((resolve) => {
     wss.on('listening', () => {
-      if (writeInfo) writeBridgeInfo({ port, token, pid: process.pid, version: VERSION, startedAt: new Date().toISOString() });
-      log(`桥已启动 ws://127.0.0.1:${port}`);
+      if (writeInfo) writeBridgeInfo({ port, host, token, pid: process.pid, version: VERSION, startedAt: new Date().toISOString() });
+      log(`桥已启动 ws://${host}:${port}`);
       resolve();
     });
   });
