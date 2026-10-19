@@ -224,6 +224,9 @@ function alreadyConfigured(t) {
   }
 }
 
+// 绝大多数客户端把 MCP server 放在顶层 mcpServers；结构不同的（ZCode 是
+// mcp.servers）用 agents.json 里的 mcpPath 指路。写错容器等于白写——配置
+// 看着有了，客户端根本不读那个键，而用户以为装好了。
 function writeJson(t) {
   const raw = fs.readFileSync(t.file, 'utf8');
   let cfg;
@@ -232,8 +235,13 @@ function writeJson(t) {
   } catch (e) {
     throw new Error(`这个文件不是合法 JSON（${e.message}），不敢动它`);
   }
-  cfg.mcpServers = cfg.mcpServers || {};
-  cfg.mcpServers['huashu-chrome'] = launcher(t.client);
+  const segs = t.mcpPath || ['mcpServers'];
+  let box = cfg;
+  for (const k of segs) {
+    if (typeof box[k] !== 'object' || box[k] === null || Array.isArray(box[k])) box[k] = {};
+    box = box[k];
+  }
+  box['huashu-chrome'] = launcher(t.client);
   fs.writeFileSync(t.file, JSON.stringify(cfg, null, 2) + '\n');
 }
 

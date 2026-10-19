@@ -9,7 +9,9 @@
     "  client  传给 MCP server 的 --client，用于审计日志区分是谁在调",
     "  kind    json（{mcpServers:{}}，绝大多数）或 toml（[mcp_servers.x]，目前只有 Codex）",
     "  paths   候选路径，按顺序取第一个存在的。~ 是 home，$APPDATA 按平台展开",
-    "          （Windows→%APPDATA%，macOS→~/Library/Application Support，Linux→~/.config）"
+    "          （Windows→%APPDATA%，macOS→~/Library/Application Support，Linux→~/.config）",
+    "  mcpPath 可选。MCP server 映射在配置文件里的路径，默认顶层 mcpServers；",
+    "          结构不同的客户端用它指路，如 ZCode 是 [\"mcp\", \"servers\"]"
   ],
   "agents": [
     { "name": "Claude Code", "client": "claude-code", "kind": "json", "paths": ["~/.claude.json", "~/.claude/mcp.json"] },
@@ -33,7 +35,7 @@
     { "name": "DeepSeek", "client": "deepseek", "kind": "json", "paths": ["~/.deepseek/mcp.json"] },
     { "name": "iFlow", "client": "iflow", "kind": "json", "paths": ["~/.iflow/settings.json"] },
     { "name": "OpenClaw", "client": "openclaw", "kind": "json", "paths": ["~/.qclaw/mcp.json", "~/.openclaw/mcp.json"] },
-    { "name": "ZCode", "client": "zcode", "kind": "json", "paths": [] }
+    { "name": "ZCode", "client": "zcode", "kind": "json", "paths": ["~/.zcode/cli/config.json"], "mcpPath": ["mcp", "servers"] }
   ],
   "_discovery": {
     "_comment": "自动发现：在 home 的点目录里按这些文件名找，内容含 mcpServers/mcp_servers 就算数。",
