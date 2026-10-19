@@ -32,7 +32,8 @@
     { "name": "Qoder", "client": "qoder", "kind": "json", "paths": ["~/.qoder/mcp.json"] },
     { "name": "DeepSeek", "client": "deepseek", "kind": "json", "paths": ["~/.deepseek/mcp.json"] },
     { "name": "iFlow", "client": "iflow", "kind": "json", "paths": ["~/.iflow/settings.json"] },
-    { "name": "OpenClaw", "client": "openclaw", "kind": "json", "paths": ["~/.qclaw/mcp.json", "~/.openclaw/mcp.json"] }
+    { "name": "OpenClaw", "client": "openclaw", "kind": "json", "paths": ["~/.qclaw/mcp.json", "~/.openclaw/mcp.json"] },
+    { "name": "ZCode", "client": "zcode", "kind": "json", "paths": [] }
   ],
   "_discovery": {
     "_comment": "自动发现：在 home 的点目录里按这些文件名找，内容含 mcpServers/mcp_servers 就算数。",
