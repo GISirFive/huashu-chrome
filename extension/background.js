@@ -750,18 +750,12 @@ async function noteMarked(tabId, on) {
 //
 // 两条铁律，都朝「宁可不画，绝不误伤」那一侧偏：
 // 1. **绝不碰用户自己的组。** tab 已经在组里而那个组不是我们建的，就当没看见。
-// 2. **只动确认还是我们的组。** groupId 记在 storage.local（跨扩展重载不丢），
-//    代价是浏览器重启后这个 id 可能被发给别的组。所以动手前先验指纹：
-//    组标题必须还是我们写上去的那个 emoji。用户改过组名？那它已经是
-//    用户的组了，按铁律 1 处理。指纹会放过「用户恰好建了个同 emoji 的组」，
-//    但那种碰撞的后果只是多染一个组，比拆错用户的组轻得多。
+// 2. **只动 storage.local 里登记过的组。** groupId 记在 storage.local（跨扩展重载
+//    不丢），动手前的唯一判据就是「这个 gid 是不是我们记下的那个」。不用组标题
+//    当指纹——标题是给人看的（会话名），不承担身份校验；用户改了组名也照常
+//    归队/摘除。浏览器重启后 gid 可能被发给别的组的碰撞窗口，由取组失败
+//    （tabGroups.get 抛错）自然兜住。
 const groupKey = (sid) => `agentGroup:${sid}`;
-
-// 组名是品牌字不是彩色圆点 emoji（花叔定的：色块图标丑）。它同时是「这个组
-// 是我们建的」的指纹。旧版组名用过身份 emoji，验指纹时兼容一阵子——
-// 不兼容的话，升级前建的组会因为指纹对不上而永远摘不掉。
-const GROUP_TITLE = '花叔';
-const groupTitleOk = (title, sid) => title === GROUP_TITLE || title === identityOf(sid).emoji;
 
 async function syncGroup(tabId, owners) {
   try {
@@ -778,7 +772,7 @@ async function syncGroup(tabId, owners) {
       for (const [sid, gid] of ours) {
         if (gid !== tab.groupId) continue;
         const g = await chrome.tabGroups.get(gid).catch(() => null);
-        if (g && groupTitleOk(g.title, sid)) await chrome.tabs.ungroup(tabId);
+        if (g) await chrome.tabs.ungroup(tabId);
         return;
       }
       return;
@@ -791,18 +785,19 @@ async function syncGroup(tabId, owners) {
       if (tab.groupId === stored) return;                         // 已经在对的组里
       if (![...ours.values()].includes(tab.groupId)) return;      // 用户的组，不碰
     }
-    // 旧组还在、还像我们的、且在同一个窗口 → 归队；否则新建。
+    // 旧组还在、且在同一个窗口 → 归队；否则新建。
     // 跨窗口不归队：group({groupId}) 会把标签页搬进另一个窗口，比不显著更糟。
     let gid = null;
     if (stored !== undefined) {
       const g = await chrome.tabGroups.get(stored).catch(() => null);
-      if (g && g.windowId === tab.windowId && groupTitleOk(g.title, o.sid)) gid = stored;
+      if (g && g.windowId === tab.windowId) gid = stored;
     }
     if (gid !== null) {
       await chrome.tabs.group({ tabIds: tabId, groupId: gid });
     } else {
       gid = await chrome.tabs.group({ tabIds: tabId });
-      await chrome.tabGroups.update(gid, { title: GROUP_TITLE, color: o.group });
+      // 组名用会话的 agent 显示名（如「Claude Code」）——信息有用，不夹带品牌。
+      await chrome.tabGroups.update(gid, { title: o.label || '', color: o.group });
       await chrome.storage.local.set({ [groupKey(o.sid)]: gid });
     }
   } catch { /* 标签页正被拖动/已关、API 不可用——都不是命令的错 */ }
