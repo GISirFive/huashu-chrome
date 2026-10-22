@@ -23,8 +23,12 @@
       try {
         const url = typeof a[0] === 'string' ? a[0] : a[0]?.url;
         const ct = res.headers.get('content-type') || '';
-        // clone() 是必须的：响应体只能被读一次，直接读会把页面自己的那份吃掉
-        const body = /json|text|javascript/.test(ct) ? (await res.clone().text()).slice(0, MAX_BODY) : '';
+        // 流式响应（SSE 等）禁做 clone().text()：clone 与页面共享底层流，
+        // await 全量读取会把 return res 挂起到流结束——页面消费被整体推迟
+        // （对话页打字机/工具卡实时渲染被破坏的根因，2026-10-22）。
+        const isStream = /event-stream/i.test(ct);
+        const body = !isStream && /json|text|javascript/.test(ct)
+          ? (await res.clone().text()).slice(0, MAX_BODY) : '';
         push({ t: Date.now(), method: a[1]?.method || 'GET', url, status: res.status, ct, body });
       } catch { /* 记录失败绝不能影响页面本身 */ }
       return res;
